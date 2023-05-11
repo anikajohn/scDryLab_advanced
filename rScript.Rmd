@@ -1,0 +1,145 @@
+---
+title: "DryLab Task 2 - SingleCellTechnologies"
+output: html_notebook
+---
+
+This is for our benefit.
+
+First we need to install and load the required packages and data, and also set the working directory!!
+
+```{r}
+
+setwd("~/NAS/Morgan/Courses/SingleCellTechnologies/DS2")
+
+# Following the tutorial for single cell seq analysis 
+# https://github.com/quadbiolab/scRNAseq_comparison_vignette/blob/master/Tutorial.md 
+
+# Step0. Import Seurat Package
+install.packages("rmarkdown")
+install.packages("devtools")
+install.packages("Seurat")
+install.packages("Matrix")
+devtools::install_github('immunogenomics/presto')
+devtools::install_github('GfellerLab/EPIC')
+devtools::install_github('quadbiolab/voxhunt')
+
+library(Seurat)
+# counts <- Read10X(data.dir = "data/") does not work for me. So I have continued with the manual renaming.
+library(Matrix)
+
+library(dplyr)
+
+counts <- readMM("data/counts.mtx.gz")
+barcodes <- rownames(read.table("data/meta.tsv.gz", stringsAsFactors=F))
+metadata <- read.table("data/meta.tsv.gz", stringsAsFactors=F)
+features <- read.csv("data/features.tsv.gz", stringsAsFactors=F, sep="\t", header=F)
+
+rownames(counts) <- make.unique(features[,1])
+colnames(counts) <- barcodes
+
+seurat <- CreateSeuratObject(counts, meta.data = metadata)
+```
+
+### quickly go through the data 
+
+```{r}
+
+seurat <- NormalizeData(seurat) %>%
+  FindVariableFeatures(nfeatures = 3000) %>%
+  CellCycleScoring(s.features = cc.genes.updated.2019$s.genes,
+                   g2m.features = cc.genes.updated.2019$g2m.genes)
+VariableFeatures(seurat) <- setdiff(VariableFeatures(seurat),
+                                    c(unlist(cc.genes.updated.2019),
+                                      grep("^MT-", rownames(seurat), value=T)))
+seurat <- ScaleData(seurat, vars.to.regress = c("G2M.Score","S.Score")) %>%
+  RunPCA(npcs = 20) %>%
+  RunUMAP(dims = 1:20)
+
+plot1 <- UMAPPlot(seurat, group.by="organoid") & NoAxes()
+plot2 <- FeaturePlot(seurat, c("FOXG1","EMX1","DLX2","MKI67"), order=T) & NoAxes() & NoLegend()
+plot1 | plot2
+
+#save the plots and data now
+# saveRDS(seurat, file = "../seurat_save1")
+#can load those data and plots too
+# seurat<- readRDS("../seurat_save1")
+```
+
+### Integration necessary 
+You would expect the data from WT to overlap and KO to overlap so you will need to integrate
+
+```{r}
+#install.packages("devtools")
+devtools::install_github("quadbiolab/simspec")
+library("simspec")
+
+seurat <- cluster_sim_spectrum(seurat, label_tag = "organoid", cluster_resolution = 1)
+seurat <- RunUMAP(seurat, reduction = "css", dims = 1:ncol(Embeddings(seurat,"css")), reduction.name = "umap_css", reduction.key = "UMAPCSS_")
+plot1 <- DimPlot(seurat, reduction = "umap_css", group.by="GLI3_status") & NoAxes()
+plot1 <- DimPlot(seurat, reduction = "umap_css", group.by="organoid") & NoAxes()
+plot2 <- FeaturePlot(seurat, c("FOXG1","EMX1","DLX2","MKI67"), reduction = "umap_css", order=T) & NoAxes() & NoLegend()
+plot1 | plot2
+```
+
+### Clustering
+
+```{r}
+
+seurat <- FindNeighbors(seurat, reduction = "css", dims = 1:ncol(Embeddings(seurat,"css"))) %>%
+  FindClusters(resolution = 1.2)
+
+plot1 <- DimPlot(seurat, reduction = "umap_css", label=T) & NoAxes() & NoLegend()
+plot1 
+
+
+```
+```{r}
+
+seurat <- FindNeighbors(seurat, reduction = "css", dims = 1:ncol(Embeddings(seurat,"css"))) %>%
+  FindClusters(resolution = 1.2)
+
+plot1 <- DimPlot(seurat, reduction = "umap_css", label=T) & NoAxes() & NoLegend()
+plot2 <- FeaturePlot(seurat,
+                     c("SOX2","DCX","FOXG1","EMX1","DLX2","MKI67","OTX2","HOXB2","TTR"),
+                     reduction = "umap_css", order=T) & NoAxes() & NoLegend()
+plot1 | plot2
+
+
+```
+
+### Clustering
+
+```{r}
+seurat$region <- factor(setNames(c("ventral telen.",#0
+                                   "non-telen.",#1
+                                   "non-telen.",#2
+                                   "dorsal telen.",
+                                   "non-telen.",
+                                   "ventral telen.",#5
+                                   "ventral telen.",
+                                   "non-telen.",
+                                   "non-telen.",
+                                   "non-telen.",
+                                   "non-telen.",#10
+                                   "non-telen.",
+                                   "ventral telen.",
+                                   "non-telen.",
+                                   "ventral telen.",
+                                   "ventral telen.",#15
+                                   "non-telen.",
+                                   "dorsal telen.",
+                                   "ventral telen.",
+                                   "non-telen.",
+                                   "dorsal telen.",#20
+                                   "dorsal telen.",
+                                   "mixed",
+                                   "non-telen.",
+                                   "non-telen."),
+                                 levels(seurat@active.ident))[seurat@active.ident],
+                        levels=c("dorsal telen.","ventral telen.","non-telen.","mixed"))
+plot1 <- DimPlot(seurat, reduction = "umap_css", group.by = "region") & NoAxes()
+plot2 <- FeaturePlot(seurat, c("SOX2","DCX","FOXG1","EMX1","DLX2","MKI67","OTX2","HOXB2","TTR"),
+                     reduction = "umap_css", order=T) & NoAxes() & NoLegend()
+plot1 | plot2
+
+```
