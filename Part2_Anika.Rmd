@@ -1,0 +1,97 @@
+---
+title: "Part2"
+author: "Anika John"
+date: "2023-05-11"
+output: html_document
+---
+## Loading saved data
+
+```{r setup, include=FALSE}
+library(Seurat)
+seurat <- readRDS('seurat_save1-1')
+
+```
+
+## Step 1. Visually check the compositions
+WT samples contain reasonable proportion of dorsal telencephalic cells, while  the KO samples have very few of them.
+
+```{r cars}
+freq <- table(seurat$region, seurat$organoid)
+prop <- apply(freq,2,function(x) x/sum(x))
+
+layout(matrix(1:3,nrow=1)); par(mar=c(8,5,1,1))
+barplot(freq, col=c("#E74C3C","#A569BD","#76D7C4","#CCD1D1"),
+        border=NA, las=2, ylab="Frequency", cex.names = 0.8)
+barplot(prop, col=c("#E74C3C","#A569BD","#76D7C4","#CCD1D1"),
+        border=NA, las=2, ylab="Proportion", cex.names = 0.8)
+plot.new()
+legend("left", fill=c("#E74C3C","#A569BD","#76D7C4","#CCD1D1"), legend=rownames(freq), bty="n")
+```
+
+## 2-1. Composition comparison with Fisher's exact test
+
+##### Fisher' Exact Test 
+
+```{r pressure, echo=FALSE}
+freq_fisher <- function(conditions, have_identity){
+  freq <- table(factor(have_identity, levels=c(TRUE,FALSE)),
+                conditions)
+  test <- fisher.test(freq)
+  res <- setNames(c(test$estimate, test$p.value), c("oddsratio","pval_fisher"))
+  return(res)
+}
+
+region_enrichment <- data.frame(region = levels(seurat$region),
+  # loop and test every region
+  t(sapply(levels(seurat$region), function(region)
+    freq_fisher(conditions = factor(seurat$GLI3_status, levels=c("KO","WT")),
+                have_identity = seurat$region == region)
+  )),
+  row.names=NULL)
+region_enrichment$padj_fisher <- p.adjust(region_enrichment$pval_fisher)
+
+region_enrichment
+```
+##### ANOVA
+
+```{r}
+freq_glm_aov <- function(samples, conditions, have_identity){
+  sample_conditions <- unique(data.frame(sample = samples, condition = conditions))
+  sample_conditions <- setNames(sample_conditions$condition, sample_conditions$sample)
+
+  freq <- table(samples, factor(have_identity, levels=c(TRUE,FALSE)))
+  m <- glm(freq ~ sample_conditions[rownames(freq)], family = "binomial")
+  aov <- anova(m, test = "Chisq")
+  res <- setNames(c(coef(m)[2], aov$Pr[2]), c("coef_glm","pval_aov"))
+  return(res)
+}
+
+region_enrichment <- data.frame(region_enrichment,
+  # loop and test every region
+  t(sapply(levels(seurat$region), function(region){
+    freq_glm_aov(samples = seurat$organoid,
+                 conditions = factor(seurat$GLI3_status, levels=c("WT","KO")),
+                 seurat$region == region)
+  })),
+  row.names=NULL)
+region_enrichment$padj_aov <- p.adjust(region_enrichment$pval_aov)
+region_enrichment
+```
+```{r}
+org_status <- unique(data.frame(organoid=seurat$organoid,
+                                GLI3_status=factor(seurat$GLI3_status, levels=c("WT","KO"))))
+org_status <- setNames(org_status$GLI3_status, org_status$organoid)
+
+layout(matrix(1:4,nrow=1))
+for(region in c("dorsal telen.","ventral telen.","non-telen.")){
+  props <- setNames(sapply(sort(unique(seurat$organoid)), function(organoid)
+                      mean(seurat$region[seurat$organoid == organoid] == region)),
+                   sort(unique(seurat$organoid)))
+  barplot(props[order(props)],
+          col = ifelse(org_status[names(props)[order(props)]] == "WT", "#cdcdcd", "#303030"),
+          ylab = "Proportions", main = region, las = 2, cex.names = 0.8)
+}
+plot.new()
+legend("left", fill = c("#cdcdcd","#303030"), legend = c("WT","KO"), bty="n")
+```
+Two KO and one WT sample show high proportions in non-telencephalon regions (non-stabel proportions).
