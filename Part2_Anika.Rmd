@@ -8,12 +8,22 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(Seurat)
+library(tidyverse)
+library(presto)
+library(DESeq2)
+library(scran)
+library(ggplot2)
+library(ggrepel)
+library(pbapply)
 seurat <- readRDS('seurat_save1-1')
+
 
 ```
 
 ## Step 1. Visually check the compositions
 WT samples contain reasonable proportion of dorsal telencephalic cells, while  the KO samples have very few of them.
+Accoring to paper, KO samples correspond to knockout of GLI3, a transcription factor that drives dorsal and ventral 
+telencephalic fate. 
 
 ```{r cars}
 freq <- table(seurat$region, seurat$organoid)
@@ -29,8 +39,6 @@ legend("left", fill=c("#E74C3C","#A569BD","#76D7C4","#CCD1D1"), legend=rownames(
 ```
 
 ## 2-1. Composition comparison with Fisher's exact test
-
-##### Fisher' Exact Test 
 
 ```{r pressure, echo=FALSE}
 freq_fisher <- function(conditions, have_identity){
@@ -52,13 +60,21 @@ region_enrichment$padj_fisher <- p.adjust(region_enrichment$pval_fisher)
 
 region_enrichment
 ```
-##### ANOVA
+## 2-2. Composition comparison with generalized linear model (GLM)
+
+ANOVA = Analysis of Variance, we compare the withing group variance to the between
+group variance. If groups have an actual effect, the variance should differ. 
+The between group variance comes from the deviation of the observed values from
+GLM model predicted values.
+
 
 ```{r}
 freq_glm_aov <- function(samples, conditions, have_identity){
   sample_conditions <- unique(data.frame(sample = samples, condition = conditions))
   sample_conditions <- setNames(sample_conditions$condition, sample_conditions$sample)
-
+ 
+  #freq = count table of cells that are either 'non-tel' or not per sample
+  #
   freq <- table(samples, factor(have_identity, levels=c(TRUE,FALSE)))
   m <- glm(freq ~ sample_conditions[rownames(freq)], family = "binomial")
   aov <- anova(m, test = "Chisq")
@@ -77,6 +93,15 @@ region_enrichment <- data.frame(region_enrichment,
 region_enrichment$padj_aov <- p.adjust(region_enrichment$pval_aov)
 region_enrichment
 ```
+*Interpretation*:  
+"The GLM model can estimates a coefficient of the KO condition in relative to WT", so the coefficient tells us
+if a cell type is enriched or depleted in KO relative to the WT. The padj_aov gives us a p-value for this 
+statement. Hence, Ventral and non-telen. cells seem to be enriched, dorsal telen seem depleted.
+  
+    
+      
+
+## Step 3. Problems of those statistics and robustness of differences
 ```{r}
 org_status <- unique(data.frame(organoid=seurat$organoid,
                                 GLI3_status=factor(seurat$GLI3_status, levels=c("WT","KO"))))
@@ -89,9 +114,234 @@ for(region in c("dorsal telen.","ventral telen.","non-telen.")){
                    sort(unique(seurat$organoid)))
   barplot(props[order(props)],
           col = ifelse(org_status[names(props)[order(props)]] == "WT", "#cdcdcd", "#303030"),
-          ylab = "Proportions", main = region, las = 2, cex.names = 0.8)
+          ylab = "Proportions", main = region, las = 2, cex.names = 0.8, srt=30)
 }
 plot.new()
 legend("left", fill = c("#cdcdcd","#303030"), legend = c("WT","KO"), bty="n")
 ```
-Two KO and one WT sample show high proportions in non-telencephalon regions (non-stabel proportions).
+  
+For non-telencephalon region, there seems to be one WT outlier. KO samples also 
+not consistent.
+
+#### Solution 2. Leave-one-sample-out and its variants
+```{r}
+region_enrichment_drop1 <- data.frame(
+  # loop and test every region
+  do.call(rbind, lapply(levels(seurat$region), function(region){
+    data.frame(region = region,
+               dropped = sort(unique(seurat$organoid)),
+
+               # loop and excl one sample each
+               t(sapply(sort(unique(seurat$organoid)), function(org){
+                 idx_cells <- which(seurat$organoid != org)
+                 freq_fisher(conditions = factor(seurat$GLI3_status, levels=c("KO","WT")),
+                             have_identity = seurat$region == region)
+               }))
+    )
+  })),
+  row.names=NULL)
+
+region_enrichment_drop1$padj_fisher <- p.adjust(region_enrichment_drop1$pval_fisher)
+region_enrichment_drop1
+```
+```{r}
+label_permut <- function(samples, conditions, num_permut = 100){
+  sample_conditions <- unique(data.frame(sample = samples, condition = conditions))
+  sample_conditions <- setNames(sample_conditions$condition, sample_conditions$sample)
+  
+  num_samples_per_conditions <- table(sample_conditions)
+  max_num_permut <- Reduce("*", sapply(2:length(num_samples_per_conditions), function(i)
+                                  choose(n = sum(num_samples_per_conditions[(i-1):length(num_samples_per_conditions)]),
+                                         k = num_samples_per_conditions[i])
+                                ))
+  
+  num_permut <- min(c(num_permut, max_num_permut))
+  
+  # generate permutations of sample-condition pairs
+  if (num_permut / max_num_permut < 0.2){ # random label shuffling
+    permut_sample_conditions <- lapply(1:num_permut, function(i)
+      setNames(sample(sample_conditions),names(sample_conditions)))
+
+  } else{ # exact label permutations
+    permuts <- utils::combn(1:length(sample_conditions), num_samples_per_conditions[1])
+    for(i in 2:length(num_samples_per_conditions)){
+      permuts <- do.call(cbind, lapply(1:ncol(permuts), function(j){
+        permuts_istep <- utils::combn(setdiff(1:length(sample_conditions), permuts[,j]),
+                                      num_samples_per_conditions[i])
+        permuts_after <- apply(permuts_istep, 2, function(x) c(permuts[,j], x))
+      }))
+    }
+    
+    conds <- rep(sort(unique(sample_conditions)), num_samples_per_conditions)
+    permut_sample_conditions <- lapply(sample(ncol(permuts))[1:num_permut], function(i)
+      setNames(conds, names(sample_conditions)[permuts[,i]])[names(sample_conditions)]
+    )
+  }
+
+  return(setNames(data.frame(as.data.frame(permut_sample_conditions),
+                             row.names=names(sample_conditions)), NULL))
+}
+permut_sample_conditions <- label_permut(seurat$organoid,
+                                         factor(seurat$GLI3_status, levels=c("WT","KO")))
+permut_sample_conditions
+
+
+```   
+Would now need to change `factor(seurat$GLI3_status, levels=c("WT","KO"))` accordingly for Fisher and ANOVA input. Seems a bit overkill, eventhough more samples than in example.  
+  
+    
+```{r}
+#cannot try this option because don't have ct information in seurat object
+# freq_glm_aov_2 <- function(conditions, have_identity, samples){
+#   m1 <- glm(have_identity ~ conditions + samples, family = binomial)
+#   m0 <- glm(have_identity ~ samples, family = binomial)
+#   aov <- anova(m1, m0, test = "Chisq")
+# 
+#   res <- setNames(c(coef(m1)["conditions"], aov$Pr[2]), c("coef","pval"))
+#   return(res)
+# }
+# 
+# ct_enrich_glm <- freq_glm_aov_2(conditions = factor(seurat$genotype, levels=c("WT","KO")),
+#                                 have_identity = seurat$ct == ct1,
+#                                 samples = seurat$sample)
+```
+
+## Part 3. Differential expression analysis
+Focusing on the Cluster-0 in the example data set, which should be the ventral telencephalic neurons based on the marker expression, we define the transcriptomic similarity between two samples as the Pearson's correlation coefficient between the average gene expression levels of cells in the two samples along the highly variable genes.
+```{r}
+seurat_ventral <- subset(seurat, subset = seurat_clusters == 0) %>%
+  FindVariableFeatures()
+
+avg_expr_org <- sapply(sort(unique(seurat$organoid)), function(org)
+  rowMeans(seurat_ventral@assays$RNA@data[,which(seurat_ventral$organoid == org)]))
+#correlation of gene expression vectors, all combinations
+corr_org <- cor(avg_expr_org[VariableFeatures(seurat_ventral),])
+plot(hclust(as.dist(1-corr_org)))
+```
+*Interpretation*:  
+One wild type sample seems very distinct from the others. There seem to be two classes of knock out samples.
+
+### Wilcoxon test for DE
+```{r}
+DE_wilcoxauc_ventral <- wilcoxauc(seurat_ventral, group_by = "GLI3_status") %>%
+  filter(group == "KO") %>%
+  mutate(DE = abs(logFC)>log(1.1) & padj < 0.01) %>%
+  mutate(DEG = ifelse(abs(logFC)>log(1.1) & padj < 0.01, feature, NA))
+
+# Log fold change = log(FC) Usually, the transformation is log at base 2, so the interpretation is straightforward: a log(FC) of 1 means twice as expressed
+#log2(FoldChange) = x; FoldChange=2^x
+
+```
+
+Are KO samples differently expressed than WT samples?  
+We would expect so because the WT samples contain more dorsal telen cells = different cell composition = diffent expression patterns.
+
+```{r}
+
+ggplot(DE_wilcoxauc_ventral, aes(x = logFC, y = -log10(padj), col=DE, label=DEG)) +
+  geom_point() +
+  geom_text_repel() +
+  geom_vline(xintercept=c(-log(1.1), log(1.1), 0), col="#303030", linetype="dotted") +
+  geom_hline(yintercept=-log10(0.01), col="#303030", linetype="dotted") +
+  scale_color_manual(values=c("#909090", "red")) +
+  theme_minimal()
+```
+*Interpretation*:  
+PAX6, MEIS2, (DLK1) = involved in dorsoventral pattering, absence of GLI3 downregulates them
+
+From Paper:  
+"This analysis suggests that the GLI3 targets HES5, EMX2 and PAX6 are major drivers of dorsal telencephalic fate, whereas FOXG1 and DMRTA1 activate ventral telencephalic fate"  
+
+We can see down regulation of PAX6 and less dorsal telenpathic cells in KO = supports statement.
+  
+LHX-8 and NKX2-1 involved in the MGE (medial ganglionic eminence == type of neurons) induction program are up-regulated in the absence of GLI3.
+
+
+
+```{r}
+det_rate <- rowMeans(seurat_ventral@assays$RNA@data)
+meta <- seurat_ventral@meta.data %>% mutate(GLI3_status = factor(GLI3_status, levels=c("WT","KO")))
+dds <- DESeqDataSetFromMatrix(seurat_ventral@assays$RNA@counts[det_rate > 0.05,],
+                              colData=meta,
+                              design = ~ GLI3_status)
+sizeFactors(dds) <- calculateSumFactors(seurat_ventral@assays$RNA@counts[det_rate > 0.05,])
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minReplicatesForReplace=Inf)
+DE_deseq2_ventral <- results(dds) %>% as.data.frame() %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate(DE = abs(log2FoldChange)>log2(1.1) & padj < 0.01) %>%
+  mutate(DEG = ifelse(abs(log2FoldChange)>log2(1.1) & padj < 0.01, gene, NA))
+
+ggplot(DE_deseq2_ventral, aes(x = log2FoldChange, y = -log10(padj), col=DE, label=DEG)) +
+  geom_point() +
+  geom_text_repel(max.overlaps = 20) +
+  geom_vline(xintercept=c(-log2(1.1), log2(1.1), 0), col="#303030", linetype="dotted") +
+  geom_hline(yintercept=-log10(0.01), col="#303030", linetype="dotted") +
+  scale_color_manual(values=c("#909090", "red")) +
+  theme_minimal()
+```
+Upregulation of LHX-8 and NKX2-1 becomes more clearly visible.
+
+```{r}
+DE_deseq2_ventral %>% filter(gene == 'PAX6' | gene == 'LINC00461')
+```
+Although not labled in plot anymore, PAX6 is still diferentially expressed (downregulated)
+```{r}
+# to do DE test for one gene
+aov_DE <- function(expr, cond, covar = NULL, family = "gaussian", test = NULL){
+  if (is.null(covar)) covar <- data.frame(X_const = 1)
+  dat <- data.frame(y = expr,
+                    cond = cond,
+		    covar)
+  m <- glm(y ~ ., family = family, data = dat)
+  m0 <- glm(y ~ . - cond, family = family, data = dat)
+
+  if (is.null(test)){
+    test <- "F"
+    if (ifelse(is(family, "family"), family$family, family) %in% c("binomial","poisson"))
+      test <- "Chisq"
+  }
+  aov <- anova(m, m0, test = test)
+
+  res <- c(coef(m)[grep("^cond",names(coef(m)))], aov$Pr[2])
+  names(res)[length(res)] <- "pval"
+  return(res)
+}
+
+DE_aov <- data.frame(t(pbsapply(which(det_rate > 0.05), function(i)
+  aov_DE(expr = seurat_ventral@assays$RNA@data[i,],
+         cond = factor(seurat_ventral$GLI3_status, levels=c("WT","KO")),
+         covar = data.frame(cov = log10(seurat_ventral$nCount_RNA))))), row.names=NULL)
+DE_aov$padj <- p.adjust(DE_aov$pval, method="BH")
+DE_aov <- data.frame(gene = names(which(det_rate > 0.05)), DE_aov) %>%
+  mutate(DE = abs(condKO)>log(1.1) & padj < 0.01) %>%
+  mutate(DEG = ifelse(abs(condKO)>log(1.1) & padj < 0.01, gene, NA))
+
+DE_aov_bin <- data.frame(t(pbsapply(which(det_rate > 0.05), function(i)
+  aov_DE(expr = seurat_ventral@assays$RNA@data[i,] > 0,
+         cond = factor(seurat_ventral$GLI3_status, levels=c("WT","KO")),
+         covar = data.frame(cov = seurat_ventral$nCount_RNA),
+         family = "binomial"))), row.names=NULL)
+DE_aov_bin$padj <- p.adjust(DE_aov_bin$pval, method="BH")
+DE_aov_bin <- data.frame(gene = names(which(det_rate > 0.05)), DE_aov_bin) %>%
+  mutate(DE = padj < 0.01) %>%
+  mutate(DEG = ifelse(padj < 0.01, gene, NA))
+
+p1 <- ggplot(DE_aov, aes(x = condKO, y = -log10(padj), col=DE, label=DEG)) +
+  geom_point() +
+  geom_text_repel(max.overlaps = 20) +
+  geom_vline(xintercept=c(-log(1.1), log(1.1), 0), col="#303030", linetype="dotted") +
+  geom_hline(yintercept=-log10(0.01), col="#303030", linetype="dotted") +
+  scale_color_manual(values=c("#909090", "red")) +
+  theme_minimal()
+p2 <- ggplot(DE_aov_bin, aes(x = condKO, y = -log10(padj), col=DE, label=DEG)) +
+  geom_point() +
+  geom_text_repel(max.overlaps = 20) +
+  geom_vline(xintercept=0, col="#303030", linetype="dotted") +
+  geom_hline(yintercept=-log10(0.01), col="#303030", linetype="dotted") +
+  scale_color_manual(values=c("#909090", "red")) +
+  theme_minimal()
+
+p1 | p2
+
+```
+Results are comparable to the ones before
